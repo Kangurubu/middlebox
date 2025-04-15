@@ -20,44 +20,46 @@ async def run():
     async def message_handler(msg):
         subject = msg.subject
         data = msg.data
-        print(f"\n Received a message on '{subject}' ({len(data)} bytes)")
-
+        # print(f"\nReceived a message on '{subject}' ({len(data)} bytes)")
         try:
             packet = Ether(data)
             if IP in packet:
                 ip_layer = packet[IP]
-                print(f" - IP src: {ip_layer.src}, dst: {ip_layer.dst}")
 
                 if TCP in ip_layer:
                     tcp_layer = ip_layer[TCP]
                     flags = tcp_layer.sprintf("%TCP.flags%")
-                    print(f" - TCP sport: {tcp_layer.sport}, dport: {tcp_layer.dport}")
-                    print(f" - TCP flags: {flags} ➜ ", end="")
+                    # print(f" - TCP sport: {tcp_layer.sport}, dport: {tcp_layer.dport}")
+                    # print(f" - TCP flags: {flags} ➜ ", end="")
+                    """
                     if flags == "S":
                         print("SYN (start of connection)")
                     elif flags == "SA":
                         print("SYN-ACK (response to SYN)")
                     elif flags == "A":
                         print("ACK (acknowledgement)")
-                    elif flags == "PA":
-                        print("PUSH-ACK (data with ACK)")
                     elif flags == "U":
                         print("URG (urgent data)")
                     else:
                         print("Other TCP flags")
-
+                    """
+                    if "R" in flags:
+                        # print(" - RST (reset connection)")
+                        return  # early return if RST flag is present, disturbs the connection
                     # Update the TCP checksum before forwarding
                     packet = update_tcp_checksum(packet)
                 else:
-                    print(" - Not a TCP packet")
+                    pass
+                    # print(" - Not a TCP packet")
             else:
-                print(" - Not an IP packet")
+                pass
+                # print(" - Not an IP packet")
         except Exception as e:
             print(f"Failed to parse packet: {e}")
 
         # Publish the received message to outpktsec and outpktinsec
         out_topic = "outpktinsec" if subject == "inpktsec" else "outpktsec"
-        print(f"Forwarding to {out_topic}")
+        # print(f"Forwarding to {out_topic}")
         await nc.publish(out_topic, bytes(packet))  # Convert the packet back to bytes
 
     # Subscribe to topics
