@@ -15,3 +15,7 @@
 *.out
 ./code/mitm/switch
 ./code/mitm/switch.o
+
+test_results
+code/python-processor/benchmark_results
+code/insec/received_files

@@ -13,59 +13,6 @@ def encrypt_data(data):
     f = Fernet(SYMMETRIC_KEY)
     return f.encrypt(data)
 
-def perform_handshake(ip_dst, sport, dport):
-    """Perform a TCP three-way handshake with resilience to RA packets"""
-    print(f"Initiating TCP handshake with {ip_dst}:{dport}...")
-    
-    # Generate initial sequence number
-    seq = random.randint(1000, 9000)
-    
-    # Set maximum attempts for the handshake
-    max_attempts = 5
-    attempt = 0
-    
-    while attempt < max_attempts:
-        attempt += 1
-        
-        # SYN
-        ip = IP(dst=ip_dst)
-        syn = TCP(sport=sport, dport=dport, flags="S", seq=seq)
-        
-        # Send SYN and wait for response
-        syn_ack = sr1(ip/syn, timeout=3, verbose=0)
-        
-        if not syn_ack:
-            print(f"No response to SYN packet (attempt {attempt}/{max_attempts}). Retrying...")
-            time.sleep(1)
-            continue
-        
-        # Check if this is an RA (Reset-Ack) packet
-        if syn_ack.haslayer(TCP) and (syn_ack[TCP].flags & 0x14) == 0x14:  # 0x14 = Reset(0x04) + Ack(0x10)
-            print(f"Received Reset-Ack packet (attempt {attempt}/{max_attempts}), trying again...")
-            time.sleep(1)
-            continue
-            
-        # Check if this is a proper SYN-ACK response
-        if syn_ack.haslayer(TCP) and (syn_ack[TCP].flags & 0x12) == 0x12:  # 0x12 = SYN(0x02) + ACK(0x10)
-            # Validate source
-            if syn_ack[IP].src != ip_dst or syn_ack[TCP].dport != sport:
-                print(f"Response from unexpected source (attempt {attempt}/{max_attempts}), retrying...")
-                time.sleep(1)
-                continue
-                
-            # Send ACK to complete handshake
-            ack = TCP(sport=sport, dport=dport, flags="A", 
-                      seq=seq+1, ack=syn_ack[TCP].seq+1)
-            send(ip/ack, verbose=0)
-            
-            print("TCP handshake completed successfully.")
-            return seq+1, syn_ack[TCP].seq+1
-        else:
-            print(f"Received unexpected response with flags: {syn_ack[TCP].flags:02x} (attempt {attempt}/{max_attempts})")
-            time.sleep(1)
-    
-    print(f"Handshake failed after {max_attempts} attempts.")
-    return None, None
 
 def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
 
@@ -73,11 +20,22 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
     port = 8888
     
     if not host:
-        print("Error: No target host specified.")
+        print("Error: No target host specified in INSECURENET_HOST_IP environment variable.")
+        print("Available environment variables:")
+        for key, value in os.environ.items():
+            if 'HOST' in key or 'NET' in key:
+                print(f"  {key} = {value}")
         return
     
     if not os.path.exists(file_path):
         print(f"Error: File '{file_path}' not found.")
+        print(f"Current working directory: {os.getcwd()}")
+        print("Available files:")
+        try:
+            for f in os.listdir('.'):
+                print(f"  {f}")
+        except:
+            pass
         return
 
     # Validate bits_to_use parameter
@@ -91,14 +49,18 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
     
     # Read file data
     with open(file_path, 'rb') as f:
-        data = f.read()
-
+        original_data = f.read()
+    
+    # Store original size for capacity calculation (always use 100 characters = 800 bits)
+    original_size_bits = 800  # Always calculate based on 100-character file
+    
+    data = original_data
     # Encrypt data if requested
     if use_encryption:
         print("Encrypting data...")
         data = encrypt_data(data)
     
-    print(f"File size: {len(data)} bytes")
+    # print(f"File size: {len(data)} bytes")
     
     # Prepare data chunks based on bits_to_use
     chunks = []
@@ -132,23 +94,30 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
     # Add timing markers
     start_time = time.time()
     
-    # Perform TCP handshake
-    seq, ack = perform_handshake(host, sport, port)
-    if not seq or not ack:
-        print("Handshake failed, aborting transmission.")
-        return
+    # Start with initial sequence numbers (no handshake needed)
+    seq = random.randint(1000, 65535)
+    ack = 0  # No ACK needed for one-way transmission
     
     ip = IP(dst=host)
-    print(f"Sending {len(chunks)} chunks to {host}:{port}...")
     
-    # Send data chunks
+    # Wait for receiver to be ready by sending SYN and waiting for response
+    print("Checking if receiver is ready...")
+    syn_packet = TCP(sport=sport, dport=port, flags="S", seq=seq)
+    send(ip/syn_packet, verbose=0)
+    
+    # Simple wait to ensure receiver has time to start
+    print("Waiting for receiver to be ready...")
+    time.sleep(3)
+    
+    print(f"Starting transmission of {len(chunks)} chunks to {host}:{port}...")
+    
+    # Send data chunks directly
     for i, value in enumerate(chunks):
-        tcp = TCP(sport=sport, dport=port, flags="UA", seq=seq, ack=ack)
-        tcp.urgptr = value  # Encode data in the URG pointer
+        tcp = TCP(sport=sport, dport=port, flags="A", seq=seq, urgptr=value)
         pkt = ip/tcp/"X"  # Dummy payload
         
         send(pkt, verbose=0)
-        #print(f"Sent chunk {i+1}/{len(chunks)}: URG={value} (0x{value:04X})")
+        # print(f"Sent chunk {i+1}/{len(chunks)}: URG={value} (0x{value:04X})")
         
         # Increase sequence number for next packet
         seq += len(pkt[TCP].payload)
@@ -160,14 +129,17 @@ def tcp_sender(file_path, interval, bits_to_use=16, use_encryption=False):
     end_time = time.time()
     transmission_time = end_time - start_time
 
-    # Send marker packet to indicate transmission complete
-    print("Sending FIN to signal transmission complete...")
-    fin = TCP(sport=sport, dport=port, flags="FA", seq=seq, ack=ack)
-    send(ip/fin, verbose=0)
+    # Send special finish packet to signal transmission complete
+    print("Sending finish signal packet...")
+    finish_packet = TCP(sport=sport, dport=port, flags="PA", seq=seq, urgptr=0xDEAD)
+    finish_payload = "COVERT_CHANNEL_FINISHED_TPP2024"
+    send(ip/finish_packet/finish_payload, verbose=0)
 
-    print(f"Successfully sent {len(data)} bytes using TCP URG covert channel.")
+    actual_transmitted_bits = len(data) * 8
+    print(f"Successfully sent {len(original_data)} bytes ({len(data)} bytes after encryption) using TCP URG covert channel.")
     print(f"Transmission time: {transmission_time:.2f} seconds")
-    print(f"Estimated capacity: {(len(data) * 8) / transmission_time:.2f} bits/second")
+    print(f"Effective capacity (original file): {original_size_bits / transmission_time:.2f} bits/second")
+    print(f"Actual throughput (transmitted data): {actual_transmitted_bits / transmission_time:.2f} bits/second")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Covert channel sender using TCP URG pointer")

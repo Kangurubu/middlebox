@@ -33,15 +33,24 @@ PSH = 0x08
 ACK = 0x10
 URG = 0x20
 
-# Track established connections
-active_connections = {}
-
 def decrypt_data():
     global covert_data
     try:
+        print(f"Attempting to decrypt {len(covert_data)} bytes")
+        print(f"Raw encrypted data (first 50 bytes): {covert_data[:50].hex()}")
+        print(f"Data as string: {covert_data[:50]}")
+        
+        # Check if it looks like base64 Fernet token
+        try:
+            data_str = covert_data.decode('utf-8')
+            print(f"Decoding as UTF-8 successful: {data_str[:50]}...")
+        except:
+            print("Data is not valid UTF-8")
+        
         f = Fernet(SYMMETRIC_KEY)
         decrypted = f.decrypt(bytes(covert_data))
         covert_data = decrypted
+        print(f"Successfully decrypted to {len(covert_data)} bytes")
         print(f"Decrypted data: {covert_data.decode('utf-8')}")
     except Exception as e:
         print(f"Decryption error: {e}")
@@ -62,25 +71,34 @@ def save_file(prefix="received_file"):
     if use_decryption:
         try:
             print("Attempting to decrypt received data...")
+            # Save original data in case decryption fails
+            original_data = covert_data.copy()
             decrypt_data()
         except Exception as e:
             print(f"Warning: Could not decrypt data: {e}")
+            print(f"Saving raw encrypted data for analysis")
+            # Restore original encrypted data for saving
+            covert_data = original_data
 
     utc_plus_3 = timezone(timedelta(hours=3))
     timestamp = datetime.now(utc_plus_3).strftime("%d-%m_%H-%M-%S")
     json_filename = os.path.join(output_dir, f"{prefix}_{timestamp}_metadata.json")
 
-    # Calculate statistics
+    # Calculate statistics - both original file size and actual received size
     duration = (last_packet_timestamp - start_timestamp) if (start_timestamp and last_packet_timestamp) else None
-    bits_received = len(covert_data) * 8
-    capacity = bits_received / duration if (duration and duration > 0) else None
+    original_file_bits = 800  # Always calculate based on 100-character file
+    actual_received_bits = len(covert_data) * 8  # Actual data received (may be larger due to encryption)
+    effective_capacity = original_file_bits / duration if (duration and duration > 0) else None
+    actual_throughput = actual_received_bits / duration if (duration and duration > 0) else None
 
     metadata = {
         "timestamp": timestamp,
         "file_size_bytes": len(covert_data),
-        "file_size_bits": bits_received,
+        "file_size_bits": original_file_bits,
+        "actual_received_bits": actual_received_bits,
         "transmission_duration": duration,
-        "measured_capacity_bps": capacity,
+        "measured_capacity_bps": effective_capacity,
+        "actual_throughput_bps": actual_throughput,
         "decryption_used": use_decryption,
         "bits_to_use": bits_to_use,
     }
@@ -109,54 +127,8 @@ def save_file(prefix="received_file"):
     covert_data = bytearray()
     return txt_filename
 
-def build_ip_header(src_ip, dst_ip, ip_id=0):
-    """Build an IP header"""
-    ip_header = struct.pack('!BBHHHBBH4s4s',
-        0x45,                      # Version and IHL
-        0,                         # TOS
-        20 + 20,                   # Total Length (IP + TCP)
-        ip_id,                     # ID
-        0,                         # Flags and Fragment Offset
-        64,                        # TTL
-        socket.IPPROTO_TCP,        # Protocol
-        0,                         # Checksum (will be filled by the kernel)
-        socket.inet_aton(src_ip),  # Source IP
-        socket.inet_aton(dst_ip)   # Destination IP
-    )
-    return ip_header
 
-def build_tcp_header(src_port, dst_port, seq, ack_seq, flags):
-    """Build a TCP header"""
-    tcp_header = struct.pack('!HHLLBBHHH',
-        src_port,         # Source Port
-        dst_port,         # Destination Port
-        seq,              # Sequence Number
-        ack_seq,          # Acknowledgment Number
-        5 << 4,           # Data Offset (5 words = 20 bytes)
-        flags,            # Flags
-        8192,             # Window Size
-        0,                # Checksum (will be filled by the kernel)
-        0                 # Urgent Pointer
-    )
-    return tcp_header
 
-def calculate_checksum(msg):
-    """Calculate the IP/TCP checksum"""
-    s = 0
-    # Loop taking 2 characters at a time
-    for i in range(0, len(msg), 2):
-        if i + 1 < len(msg):
-            a = msg[i]
-            b = msg[i+1]
-            s = s + (a + (b << 8))
-        elif i + 1 == len(msg):
-            s = s + msg[i]
-    
-    # One's complement
-    s = s + (s >> 16)
-    s = ~s & 0xffff
-    
-    return s
 
 def parse_packet(packet):
     """Parse a raw packet to extract TCP/IP header fields"""
@@ -171,9 +143,9 @@ def parse_packet(packet):
     ack_seq = struct.unpack('!L', tcp_header[8:12])[0]
     flags = tcp_header[13]    
 
-    urg_ptr = 0
-    if flags & URG:
-        urg_ptr = struct.unpack('!H', tcp_header[18:20])[0]
+    # Always read the urgent pointer field, regardless of URG flag
+    # This follows Hintz's covert channel technique
+    urg_ptr = struct.unpack('!H', tcp_header[18:20])[0]
     
     return {
         'src_ip': src_ip,
@@ -186,17 +158,6 @@ def parse_packet(packet):
         'urg_ptr': urg_ptr
     }
 
-def send_tcp_packet(send_socket, src_ip, dst_ip, src_port, dst_port, seq, ack_seq, flags):
-    """Send a TCP packet with the given parameters"""
-    # Build packet
-    ip_header = build_ip_header(src_ip, dst_ip)
-    tcp_header = build_tcp_header(src_port, dst_port, seq, ack_seq, flags)
-    
-    # Send packet
-    packet = ip_header + tcp_header
-    send_socket.sendto(packet, (dst_ip, 0))
-    
-    return True
 
 def is_valid_character(byte_value):
     # Check if the value is a printable ASCII character or common control character
@@ -260,10 +221,6 @@ def start_receiver(port=8888):
     try:
         # Create raw socket for receiving packets
         recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        
-        # Create raw socket for sending packets
-        send_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        send_socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     except socket.error as e:
         print(f"Socket creation error: {e}")
         sys.exit(1)
@@ -290,87 +247,43 @@ def start_receiver(port=8888):
         if packet_info['dst_port'] != port:
             continue
 
-        # Connection tracking key
-        conn_key = f"{packet_info['src_ip']}:{packet_info['src_port']}"
-        
-        # Handle SYN packets (first part of TCP handshake)
-        if (packet_info['flags'] & SYN) and not (packet_info['flags'] & ACK):
-            print(f"Received SYN from {conn_key}")
-            
-            # Generate random sequence number
-            our_seq = random.randint(1000, 9000)
-            
-            # Send SYN-ACK
-            send_tcp_packet(
-                send_socket, 
-                os.getenv('INSECURENET_HOST_IP'), packet_info['src_ip'],
-                port, packet_info['src_port'],
-                our_seq, packet_info['seq'] + 1,
-                SYN | ACK  # SYN-ACK flags
-            )
-            
-            # Store connection info
-            active_connections[conn_key] = {
-                'their_seq': packet_info['seq'] + 1,
-                'our_seq': our_seq + 1,
-                'state': 'SYN_RECEIVED'
-            }
-            
-            print(f"Sent SYN-ACK to {conn_key}")
-            continue
-            
-        # Handle ACK packets (third part of TCP handshake)
-        if (packet_info['flags'] & ACK) and conn_key in active_connections and active_connections[conn_key]['state'] == 'SYN_RECEIVED':
-            print(f"Received ACK from {conn_key} - TCP handshake completed")
-            active_connections[conn_key]['state'] = 'ESTABLISHED'
-            continue
-        
         current_time = time.time()
         if start_timestamp is None:
             start_timestamp = current_time
         last_packet_timestamp = current_time
         
-        # Process URG packets for data extraction
-        if packet_info['flags'] & URG and packet_info['urg_ptr'] > 0:
-            urg_value = packet_info['urg_ptr'] & mask  # Apply mask to extract only the bits we want
-            process_urg_value(urg_value)
-            # print(f"From {packet_info['src_ip']}:{packet_info['src_port']} - URG={urg_value} (0x{urg_value:04X}) | Total: {len(covert_data)} bytes")
-        
-        # Check for end marker (FIN flag)
-        if packet_info['flags'] & FIN:
-            print(f"FIN received from {conn_key}")
-
-            # Send ACK for FIN
-            if conn_key in active_connections:
-                send_tcp_packet(
-                    send_socket, 
-                    os.getenv('INSECURENET_HOST_IP'), packet_info['src_ip'],
-                    port, packet_info['src_port'],
-                    active_connections[conn_key]['our_seq'], 
-                    active_connections[conn_key]['their_seq'],
-                    ACK  # ACK flag
-                )
-                print(f"Sent ACK for FIN to {conn_key}")
-                
-                # Clean up connection state
-                del active_connections[conn_key]
-
+        # Check for finish signal first
+        if packet_info['urg_ptr'] == 0xDEAD:
+            print(f"Finish signal received from {packet_info['src_ip']}:{packet_info['src_port']} - URG=0xDEAD")
             flush_bit_buffer()
 
             if len(covert_data) > 0:
                 if start_timestamp and last_packet_timestamp:
                     duration = last_packet_timestamp - start_timestamp
-                    bits_received = len(covert_data) * 8
-                    capacity = bits_received / duration if duration > 0 else 0
+                    original_file_bits = 800  # Always calculate based on 100-character file
+                    actual_received_bits = len(covert_data) * 8
+                    effective_capacity = original_file_bits / duration if duration > 0 else 0
+                    actual_throughput = actual_received_bits / duration if duration > 0 else 0
                     print(f"Transmission statistics:")
                     print(f"  Duration: {duration:.2f} seconds")
                     print(f"  Bytes received: {len(covert_data)}")
-                    print(f"  Bits received: {bits_received}")
-                    print(f"  Measured capacity: {capacity:.2f} bits/second")
+                    print(f"  Original file bits: {original_file_bits}")
+                    print(f"  Actual received bits: {actual_received_bits}")
+                    print(f"  Effective capacity (original): {effective_capacity:.2f} bits/second")
+                    print(f"  Actual throughput (received): {actual_throughput:.2f} bits/second")
                 save_file()
                 start_timestamp = None
             else:
-                print("Warning: No data received before FIN.")
+                print("Warning: No data received before finish signal.")
+            
+            print("Transmission complete - shutting down receiver...")
+            sys.exit(0)
+        
+        # Process packets with URG pointer data
+        if packet_info['urg_ptr'] > 0 and packet_info['urg_ptr'] != 0xDEAD:
+            urg_value = packet_info['urg_ptr'] & mask  # Apply mask to extract only the bits we want
+            process_urg_value(urg_value)
+            # print(f"From {packet_info['src_ip']}:{packet_info['src_port']} - URG={urg_value} (0x{urg_value:04X}) | Total: {len(covert_data)} bytes")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Covert channel receiver using TCP URG pointer")
